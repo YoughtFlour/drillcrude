@@ -357,6 +357,222 @@ class CoordinatorClient:
         async with self.session.get(f"{self.url}/v1/claim-calldata?epochs={epoch_str}") as resp:
             return await resp.json()
 
+# ============ DETERMINISTIC DOCUMENT PARSER (NO LLM) ============
+import dataclasses
+from typing import Optional, List, Tuple
+
+@dataclasses.dataclass
+class CompanyData:
+    name: str
+    paragraph_idx: int = 0
+    employees: Optional[int] = None
+    founded: Optional[int] = None
+    revenue_millions: Optional[int] = None
+    margin: Optional[int] = None
+
+# Regex patterns for data extraction (case-insensitive)
+_EMPLOYEES_RE = [
+    re.compile(r'([\d,]+)\s+employees', re.I),
+    re.compile(r'employs?\s+([\d,]+)', re.I),
+    re.compile(r'workforce\s+of\s+([\d,]+)', re.I),
+    re.compile(r'(?:team|staff)\s+of\s+([\d,]+)', re.I),
+    re.compile(r'([\d,]+)\s+(?:people|workers|staff)\b', re.I),
+    re.compile(r'([\d,]+)-(?:person|employee|member)', re.I),
+    re.compile(r'headcount\s+of\s+([\d,]+)', re.I),
+]
+
+_FOUNDED_RE = [
+    re.compile(r'(?:founded|established|incorporated|started|formed|launched|created|organized)\s+in\s+(\d{4})', re.I),
+    re.compile(r'since\s+(\d{4})', re.I),
+    re.compile(r'dating\s+back\s+to\s+(\d{4})', re.I),
+    re.compile(r'origins?\s+in\s+(\d{4})', re.I),
+    re.compile(r'in\s+operation\s+since\s+(\d{4})', re.I),
+    re.compile(r'opened\s+(?:its\s+doors\s+)?in\s+(\d{4})', re.I),
+    re.compile(r'traces?\s+(?:its\s+)?(?:roots?|history)\s+(?:back\s+)?to\s+(\d{4})', re.I),
+]
+
+_REVENUE_RE = [
+    re.compile(r'\$\s*([\d.]+)\s*[Bb](?:illion)?', re.I),
+    re.compile(r'\$\s*([\d.]+)\s*[Mm](?:illion)?', re.I),
+    re.compile(r'revenue\s+of\s+\$\s*([\d.]+)\s*([BbMm])', re.I),
+    re.compile(r'\$\s*([\d.]+)\s*([BbMm]).*?revenue', re.I),
+]
+
+_MARGIN_RE = [
+    re.compile(r'operating\s+margin\s+(?:of\s+|at\s+|around\s+|near\s+|approximately\s+)?(\d+(?:\.\d+)?)\s*%', re.I),
+    re.compile(r'(\d+(?:\.\d+)?)\s*%\s+operating\s+margin', re.I),
+    re.compile(r'margin\s+of\s+(\d+(?:\.\d+)?)\s*%', re.I),
+    re.compile(r'(\d+(?:\.\d+)?)\s*%\s*margin', re.I),
+]
+
+# Question type classification
+_QUESTION_MAP = [
+    (re.compile(r'highest.*revenue', re.I),             ('revenue_millions', 'max')),
+    (re.compile(r'largest.*revenue', re.I),              ('revenue_millions', 'max')),
+    (re.compile(r'greatest.*revenue', re.I),             ('revenue_millions', 'max')),
+    (re.compile(r'most.*revenue', re.I),                 ('revenue_millions', 'max')),
+    (re.compile(r'lowest.*revenue', re.I),               ('revenue_millions', 'min')),
+    (re.compile(r'smallest.*revenue', re.I),             ('revenue_millions', 'min')),
+    (re.compile(r'least.*revenue', re.I),                ('revenue_millions', 'min')),
+    (re.compile(r'highest.*margin', re.I),               ('margin', 'max')),
+    (re.compile(r'largest.*margin', re.I),               ('margin', 'max')),
+    (re.compile(r'greatest.*margin', re.I),              ('margin', 'max')),
+    (re.compile(r'lowest.*margin', re.I),                ('margin', 'min')),
+    (re.compile(r'smallest.*margin', re.I),              ('margin', 'min')),
+    (re.compile(r'narrowest.*margin', re.I),             ('margin', 'min')),
+    (re.compile(r'most\s+employees', re.I),              ('employees', 'max')),
+    (re.compile(r'(?:largest|biggest)\s+(?:work)?(?:force|team|staff)', re.I),  ('employees', 'max')),
+    (re.compile(r'(?:largest|biggest)\s+(?:number|count)\s+of\s+employee', re.I),  ('employees', 'max')),
+    (re.compile(r'highest.*employee', re.I),             ('employees', 'max')),
+    (re.compile(r'fewest\s+employees', re.I),            ('employees', 'min')),
+    (re.compile(r'(?:smallest|lowest).*(?:work)?(?:force|team|staff|employee)', re.I), ('employees', 'min')),
+    (re.compile(r'founded.*earliest', re.I),             ('founded', 'min')),
+    (re.compile(r'oldest', re.I),                        ('founded', 'min')),
+    (re.compile(r'longest.*(?:history|operation|business)', re.I), ('founded', 'min')),
+    (re.compile(r'founded.*(?:most\s+)?recently', re.I), ('founded', 'max')),
+    (re.compile(r'newest', re.I),                        ('founded', 'max')),
+    (re.compile(r'youngest', re.I),                      ('founded', 'max')),
+    (re.compile(r'most\s+recently\s+(?:founded|established|created)', re.I), ('founded', 'max')),
+]
+
+
+def _extract_int(text, patterns):
+    """Try each regex pattern, return first matched integer or None"""
+    for pat in patterns:
+        m = pat.search(text)
+        if m:
+            return int(m.group(1).replace(',', ''))
+    return None
+
+
+def _extract_revenue_millions(text):
+    """Extract revenue in millions from paragraph text"""
+    for pat in _REVENUE_RE:
+        m = pat.search(text)
+        if m:
+            val = float(m.group(1))
+            # Check if it's billions or millions
+            full_match = m.group(0).lower()
+            if 'b' in full_match.replace('$', '').replace(str(m.group(1)), '', 1)[:5]:
+                return int(val * 1000)
+            else:
+                return int(val)
+    return None
+
+
+def _extract_margin(text):
+    """Extract operating margin percentage from paragraph text"""
+    for pat in _MARGIN_RE:
+        m = pat.search(text)
+        if m:
+            return int(float(m.group(1)))
+    return None
+
+
+def parse_companies(doc: str, companies: list) -> List[CompanyData]:
+    """Parse document into structured company data. No LLM needed."""
+    paragraphs = [p.strip() for p in doc.split('\n\n') if p.strip()]
+    # Also try single newline split if we get too few paragraphs
+    if len(paragraphs) < len(companies) // 2:
+        paragraphs = [p.strip() for p in doc.split('\n') if p.strip() and len(p.strip()) > 50]
+
+    result = []
+    for company in companies:
+        # Find paragraph containing this company
+        para_text = None
+        para_idx = 0
+        for i, para in enumerate(paragraphs):
+            if company in para:
+                para_text = para
+                para_idx = i + 1  # 1-indexed for trace
+                break
+
+        if not para_text:
+            # Try case-insensitive
+            for i, para in enumerate(paragraphs):
+                if company.lower() in para.lower():
+                    para_text = para
+                    para_idx = i + 1
+                    break
+
+        if not para_text:
+            result.append(CompanyData(name=company))
+            continue
+
+        cd = CompanyData(
+            name=company,
+            paragraph_idx=para_idx,
+            employees=_extract_int(para_text, _EMPLOYEES_RE),
+            founded=_extract_int(para_text, _FOUNDED_RE),
+            revenue_millions=_extract_revenue_millions(para_text),
+            margin=_extract_margin(para_text),
+        )
+        result.append(cd)
+
+    return result
+
+
+def parse_question(question: str) -> Optional[Tuple[str, str]]:
+    """Classify question into (field, direction). Returns None if unknown."""
+    for pat, result in _QUESTION_MAP:
+        if pat.search(question):
+            return result
+    return None
+
+
+def deterministic_pass1(doc, questions, companies):
+    """
+    Pure-Python Pass 1: parse doc, answer question, extract data.
+    Returns (company_name, extracted_data_dict) or (None, None) on failure.
+    """
+    try:
+        parsed = parse_companies(doc, companies)
+        debug_log("DET_PARSED", {c.name: {"emp": c.employees, "yr": c.founded, "rev": c.revenue_millions, "margin": c.margin} for c in parsed})
+
+        # Use first question (challenges always have 1)
+        q = questions[0] if questions else ""
+        qtype = parse_question(q)
+        if qtype is None:
+            debug_log("DET_QUESTION_UNKNOWN", q)
+            return None, None
+
+        field, direction = qtype
+        debug_log("DET_QUESTION", {"q": q, "field": field, "direction": direction})
+
+        # Filter companies that have the required field
+        valid = [c for c in parsed if getattr(c, field) is not None]
+        if not valid:
+            debug_log("DET_NO_VALID", {"field": field, "total": len(parsed)})
+            return None, None
+
+        # Select winner
+        if direction == 'max':
+            winner = max(valid, key=lambda c: getattr(c, field))
+        else:
+            winner = min(valid, key=lambda c: getattr(c, field))
+
+        # Build extracted_data dict (compatible with existing code)
+        data = {
+            "Q1_ANSWER": winner.name,
+            "Q1_EMPLOYEES": str(winner.employees) if winner.employees is not None else "N/A",
+            "Q1_FOUNDED": str(winner.founded) if winner.founded is not None else "N/A",
+            "Q1_REVENUE": f"{winner.revenue_millions}M" if winner.revenue_millions is not None else "N/A",
+            "Q1_MARGIN": str(winner.margin) if winner.margin is not None else "N/A",
+            "employees": str(winner.employees) if winner.employees is not None else "N/A",
+            "founded": str(winner.founded) if winner.founded is not None else "N/A",
+            "revenue": f"{winner.revenue_millions}M" if winner.revenue_millions is not None else "N/A",
+            "margin": str(winner.margin) if winner.margin is not None else "N/A",
+            "_paragraph_idx": winner.paragraph_idx,
+        }
+
+        debug_log("DET_WINNER", {"company": winner.name, "field": field, "value": getattr(winner, field), "data": data})
+        return winner.name, data
+
+    except Exception as e:
+        debug_log("DET_ERROR", {"error": str(e)})
+        return None, None
+
+
 # ============ LOCAL COMPUTE ENGINE ============
 def _parse_revenue_to_millions(rev_str):
     """Parse revenue string to millions: '$8.5B' -> 8500, '4.4B' -> 4400, '750M' -> 750"""
@@ -555,7 +771,7 @@ class LLMSolver:
         return constraints[-1] if constraints else ""
 
     def solve(self, doc, questions, constraints, companies):
-        """Smart solver: LLM identifies company + extracts data, Python computes artifact."""
+        """Smart solver: deterministic first, LLM fallback."""
         debug_log("CHALLENGE_INPUT", {
             "doc_len": len(doc),
             "questions": questions,
@@ -563,6 +779,28 @@ class LLMSolver:
             "companies": companies
         })
 
+        transform_constraint = self._find_transform_constraint(constraints)
+
+        # === TRY FULLY DETERMINISTIC SOLVE (no LLM, ~0.1ms) ===
+        det_company, det_data = deterministic_pass1(doc, questions, companies)
+        if det_company:
+            artifact, method = compute_artifact_locally(det_company, det_data, transform_constraint)
+            if artifact is not None:
+                log(f"⚡ DETERMINISTIC: '{artifact}' via {method} (company: {det_company})")
+                debug_log("DETERMINISTIC_OK", {"artifact": artifact, "method": method, "company": det_company, "data": det_data})
+                return artifact, det_company, det_data
+            else:
+                log(f"Det Pass 1 OK ({det_company}) but local compute failed, falling to LLM Pass 2")
+                # Skip LLM Pass 1, go straight to Pass 2 with det data
+                primary_company = det_company
+                extracted_data = det_data
+                validated_answers = {"Q1": det_company}
+                # Jump to Pass 2 below
+                return self._llm_pass2(doc, det_company, det_data, validated_answers, constraints)
+        else:
+            debug_log("DET_FALLBACK_LLM", "Deterministic parser failed, using LLM")
+
+        # === LLM FALLBACK PATH ===
         q_text = "\n".join(f"Q{i+1}: {q}" for i, q in enumerate(questions))
         companies_text = "\n".join(f"- {c}" for c in companies)
 
@@ -655,7 +893,6 @@ Rules:
         primary_company = max(company_counts, key=company_counts.get) if company_counts else ""
 
         # === TRY LOCAL COMPUTE FIRST (deterministic, 100% accurate) ===
-        transform_constraint = self._find_transform_constraint(constraints)
         artifact, method = compute_artifact_locally(primary_company, extracted_data, transform_constraint)
 
         if artifact is not None:
@@ -664,6 +901,10 @@ Rules:
             return artifact, primary_company, extracted_data
 
         # === FALLBACK: Pass 2 (LLM computes) ===
+        return self._llm_pass2(doc, primary_company, extracted_data, validated_answers, constraints)
+
+    def _llm_pass2(self, doc, primary_company, extracted_data, validated_answers, constraints):
+        """LLM Pass 2: compute artifact when local compute can't handle the constraint."""
         log("Local compute failed, falling back to LLM Pass 2")
         answers_text = "\n".join(f"{k}: {v}" for k, v in validated_answers.items())
         data_text = "\n".join(f"{k}: {v}" for k, v in extracted_data.items())
@@ -912,13 +1153,15 @@ async def drilling_loop(bankr, coord, solver):
             log(f"Solution: '{artifact}' (company: {company})")
 
             # Build trace
-            doc_text = challenge.get("doc", "")
-            paragraphs = [p.strip() for p in doc_text.split("\n\n") if p.strip()]
-            company_para = 1
-            for i, para in enumerate(paragraphs, 1):
-                if company in para:
-                    company_para = i
-                    break
+            company_para = extracted.get("_paragraph_idx", 0)
+            if not company_para:
+                doc_text = challenge.get("doc", "")
+                paragraphs = [p.strip() for p in doc_text.split("\n\n") if p.strip()]
+                company_para = 1
+                for i, para in enumerate(paragraphs, 1):
+                    if company in para:
+                        company_para = i
+                        break
 
             employees = extracted.get("employees") or extracted.get("Q1_EMPLOYEES", "N/A")
             founded = extracted.get("founded") or extracted.get("Q1_FOUNDED", "N/A")
