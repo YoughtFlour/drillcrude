@@ -171,30 +171,46 @@ class BankrClient:
             await self.session.close()
 
     async def sign(self, message):
-        async with self.session.post(
-            f"{self.base_url}/agent/sign",
-            json={"signatureType": "personal_sign", "message": message},
-            headers={"Content-Type": "application/json", "X-API-Key": self.api_key}
-        ) as resp:
-            data = await resp.json()
-            return data["signature"]
+        for attempt in range(5):
+            try:
+                async with self.session.post(
+                    f"{self.base_url}/agent/sign",
+                    json={"signatureType": "personal_sign", "message": message},
+                    headers={"Content-Type": "application/json", "X-API-Key": self.api_key}
+                ) as resp:
+                    data = await resp.json()
+                    return data["signature"]
+            except Exception as e:
+                if attempt < 4:
+                    log(f"Bankr sign retry {attempt+1}/5: {e}", "WARN")
+                    await asyncio.sleep(10)
+                else:
+                    raise
 
     async def submit_tx(self, tx, description="Transaction"):
-        async with self.session.post(
-            f"{self.base_url}/agent/submit",
-            json={
-                "transaction": {
-                    "to": tx["to"],
-                    "chainId": tx["chainId"],
-                    "value": tx.get("value", "0"),
-                    "data": tx["data"]
-                },
-                "description": description,
-                "waitForConfirmation": True
-            },
-            headers={"Content-Type": "application/json", "X-API-Key": self.api_key}
-        ) as resp:
-            return await resp.json()
+        for attempt in range(5):
+            try:
+                async with self.session.post(
+                    f"{self.base_url}/agent/submit",
+                    json={
+                        "transaction": {
+                            "to": tx["to"],
+                            "chainId": tx["chainId"],
+                            "value": tx.get("value", "0"),
+                            "data": tx["data"]
+                        },
+                        "description": description,
+                        "waitForConfirmation": True
+                    },
+                    headers={"Content-Type": "application/json", "X-API-Key": self.api_key}
+                ) as resp:
+                    return await resp.json()
+            except Exception as e:
+                if attempt < 4:
+                    log(f"Bankr submit retry {attempt+1}/5: {e}", "WARN")
+                    await asyncio.sleep(10)
+                else:
+                    raise
 
     async def get_balances(self):
         async with self.session.post(
@@ -746,14 +762,20 @@ async def receipt_poster(bankr):
     while True:
         try:
             tx, desc = await _pending_receipts.get()
-            try:
-                tx_result = await bankr.submit_tx(tx, desc)
-                if tx_result.get("success"):
-                    log(f"Receipt posted: {tx_result.get('transactionHash', '?')[:16]}...")
-                else:
-                    log(f"Receipt FAILED: {tx_result.get('error', '?')}", "ERROR")
-            except Exception as e:
-                log(f"Receipt post error: {e}", "ERROR")
+            for attempt in range(3):
+                try:
+                    tx_result = await bankr.submit_tx(tx, desc)
+                    if tx_result.get("success"):
+                        log(f"Receipt posted: {tx_result.get('transactionHash', '?')[:16]}...")
+                    else:
+                        log(f"Receipt FAILED: {tx_result.get('error', '?')}", "ERROR")
+                    break  # success or known failure, don't retry
+                except Exception as e:
+                    if attempt < 2:
+                        log(f"Receipt retry {attempt+1}/3: {e}", "WARN")
+                        await asyncio.sleep(5)
+                    else:
+                        log(f"Receipt dropped after 3 retries: {e}", "ERROR")
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -1067,17 +1089,19 @@ async def main():
     await bankr.init()
     await coord.init()
 
-    # Initial auth (retry up to 3 times)
-    for attempt in range(3):
+    # Initial auth (retry until success)
+    for attempt in range(10):
         try:
             await coord.ensure_auth()
             break
-        except AuthError as e:
+        except Exception as e:
             log(f"Auth attempt {attempt+1} failed: {e}", "ERROR")
-            if attempt < 2:
-                await backoff_sleep(attempt)
+            if attempt < 9:
+                wait = min(30, 5 * (attempt + 1))
+                log(f"Retrying in {wait}s...", "WARN")
+                await asyncio.sleep(wait)
             else:
-                log("Auth failed after 3 attempts, exiting", "ERROR")
+                log("Auth failed after 10 attempts, exiting", "ERROR")
                 return
 
     shutdown_event = asyncio.Event()
