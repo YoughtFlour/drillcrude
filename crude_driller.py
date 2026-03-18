@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CRUDE Driller v5.0 - Full Autopilot (Local Compute)
+CRUDE Driller v6.1 - Alternate Retry + Space Fixes
 Architecture: 3 async loops (drilling, claiming, monitoring)
 Key improvement: LLM only identifies company, Python computes artifact deterministically
 """
@@ -476,38 +476,41 @@ def parse_companies(doc: str, companies: list) -> List[CompanyData]:
     if len(paragraphs) < len(companies) // 2:
         paragraphs = [p.strip() for p in doc.split('\n') if p.strip() and len(p.strip()) > 50]
 
-    result = []
-    for company in companies:
-        # Find paragraph containing this company
-        para_text = None
-        para_idx = 0
-        for i, para in enumerate(paragraphs):
+    # Map each paragraph to its matching company (1 paragraph = 1 company)
+    para_to_company = {}
+    for i, para in enumerate(paragraphs):
+        for company in companies:
             if company in para:
-                para_text = para
-                para_idx = i + 1  # 1-indexed for trace
+                if i not in para_to_company:
+                    para_to_company[i] = company
                 break
-
-        if not para_text:
+        else:
             # Try case-insensitive
-            for i, para in enumerate(paragraphs):
+            for company in companies:
                 if company.lower() in para.lower():
-                    para_text = para
-                    para_idx = i + 1
+                    if i not in para_to_company:
+                        para_to_company[i] = company
                     break
 
-        if not para_text:
-            result.append(CompanyData(name=company))
-            continue
+    # Reverse map: company -> paragraph index
+    company_to_para = {v: k for k, v in para_to_company.items()}
 
-        cd = CompanyData(
-            name=company,
-            paragraph_idx=para_idx,
-            employees=_extract_int(para_text, _EMPLOYEES_RE),
-            founded=_extract_int(para_text, _FOUNDED_RE),
-            revenue_millions=_extract_revenue_millions(para_text),
-            margin=_extract_margin(para_text),
-        )
-        result.append(cd)
+    result = []
+    for company in companies:
+        if company in company_to_para:
+            pi = company_to_para[company]
+            para_text = paragraphs[pi]
+            cd = CompanyData(
+                name=company,
+                paragraph_idx=pi + 1,  # 1-indexed for trace
+                employees=_extract_int(para_text, _EMPLOYEES_RE),
+                founded=_extract_int(para_text, _FOUNDED_RE),
+                revenue_millions=_extract_revenue_millions(para_text),
+                margin=_extract_margin(para_text),
+            )
+            result.append(cd)
+        else:
+            result.append(CompanyData(name=company))
 
     return result
 
@@ -520,21 +523,39 @@ def parse_question(question: str) -> Optional[Tuple[str, str]]:
     return None
 
 
+def _build_company_data(c):
+    """Build extracted_data dict from a CompanyData object."""
+    return {
+        "Q1_ANSWER": c.name,
+        "Q1_EMPLOYEES": str(c.employees) if c.employees is not None else "N/A",
+        "Q1_FOUNDED": str(c.founded) if c.founded is not None else "N/A",
+        "Q1_REVENUE": f"{c.revenue_millions}M" if c.revenue_millions is not None else "N/A",
+        "Q1_MARGIN": str(c.margin) if c.margin is not None else "N/A",
+        "employees": str(c.employees) if c.employees is not None else "N/A",
+        "founded": str(c.founded) if c.founded is not None else "N/A",
+        "revenue": f"{c.revenue_millions}M" if c.revenue_millions is not None else "N/A",
+        "margin": str(c.margin) if c.margin is not None else "N/A",
+        "_paragraph_idx": c.paragraph_idx,
+    }
+
+
 def deterministic_pass1(doc, questions, companies):
     """
     Pure-Python Pass 1: parse doc, answer question, extract data.
-    Returns (company_name, extracted_data_dict) or (None, None) on failure.
+    Returns (company_name, extracted_data_dict, tied_alternates) or (None, None, []) on failure.
+    tied_alternates is a list of (company_name, data_dict) for other companies that tied on the question field.
     """
     try:
+        debug_log("DET_DOC", doc[:2000])  # Log raw document for debugging
         parsed = parse_companies(doc, companies)
-        debug_log("DET_PARSED", {c.name: {"emp": c.employees, "yr": c.founded, "rev": c.revenue_millions, "margin": c.margin} for c in parsed})
+        debug_log("DET_PARSED", {c.name: {"emp": c.employees, "yr": c.founded, "rev": c.revenue_millions, "margin": c.margin, "para_idx": c.paragraph_idx} for c in parsed})
 
         # Use first question (challenges always have 1)
         q = questions[0] if questions else ""
         qtype = parse_question(q)
         if qtype is None:
             debug_log("DET_QUESTION_UNKNOWN", q)
-            return None, None
+            return None, None, []
 
         field, direction = qtype
         debug_log("DET_QUESTION", {"q": q, "field": field, "direction": direction})
@@ -543,34 +564,38 @@ def deterministic_pass1(doc, questions, companies):
         valid = [c for c in parsed if getattr(c, field) is not None]
         if not valid:
             debug_log("DET_NO_VALID", {"field": field, "total": len(parsed)})
-            return None, None
+            return None, None, []
 
-        # Select winner
+        # Select winner (use paragraph_idx as tiebreaker — first in doc wins)
         if direction == 'max':
-            winner = max(valid, key=lambda c: getattr(c, field))
+            winner = max(valid, key=lambda c: (getattr(c, field), -(c.paragraph_idx or 999)))
         else:
-            winner = min(valid, key=lambda c: getattr(c, field))
+            winner = min(valid, key=lambda c: (getattr(c, field), c.paragraph_idx or 999))
 
-        # Build extracted_data dict (compatible with existing code)
-        data = {
-            "Q1_ANSWER": winner.name,
-            "Q1_EMPLOYEES": str(winner.employees) if winner.employees is not None else "N/A",
-            "Q1_FOUNDED": str(winner.founded) if winner.founded is not None else "N/A",
-            "Q1_REVENUE": f"{winner.revenue_millions}M" if winner.revenue_millions is not None else "N/A",
-            "Q1_MARGIN": str(winner.margin) if winner.margin is not None else "N/A",
-            "employees": str(winner.employees) if winner.employees is not None else "N/A",
-            "founded": str(winner.founded) if winner.founded is not None else "N/A",
-            "revenue": f"{winner.revenue_millions}M" if winner.revenue_millions is not None else "N/A",
-            "margin": str(winner.margin) if winner.margin is not None else "N/A",
-            "_paragraph_idx": winner.paragraph_idx,
-        }
+        winner_val = getattr(winner, field)
 
-        debug_log("DET_WINNER", {"company": winner.name, "field": field, "value": getattr(winner, field), "data": data})
-        return winner.name, data
+        # Find tied candidates (same field value, different company)
+        tied = [c for c in valid if getattr(c, field) == winner_val and c.name != winner.name]
+        # Sort tied candidates by paragraph_idx (opposite order from winner's tiebreaker)
+        if direction == 'max':
+            tied.sort(key=lambda c: c.paragraph_idx or 999)  # winner used -(para_idx), so alternates are later ones
+        else:
+            tied.sort(key=lambda c: -(c.paragraph_idx or 999))
+
+        tied_alternates = [(c.name, _build_company_data(c)) for c in tied]
+
+        data = _build_company_data(winner)
+
+        if tied_alternates:
+            debug_log("DET_WINNER", {"company": winner.name, "field": field, "value": winner_val, "data": data,
+                                     "tied_with": [t[0] for t in tied_alternates]})
+        else:
+            debug_log("DET_WINNER", {"company": winner.name, "field": field, "value": winner_val, "data": data})
+        return winner.name, data, tied_alternates
 
     except Exception as e:
         debug_log("DET_ERROR", {"error": str(e)})
-        return None, None
+        return None, None, []
 
 
 # ============ LOCAL COMPUTE ENGINE ============
@@ -599,7 +624,11 @@ def _parse_int(s):
     return int(m.group()) if m else None
 
 def compute_artifact_locally(company_name, extracted_data, constraint_text):
-    """Compute artifact deterministically in Python. Returns (artifact, method) or (None, None)."""
+    """
+    Compute artifact deterministically in Python.
+    Returns (artifact, method, alt_artifacts) or (None, None, []).
+    alt_artifacts is a list of alternative artifact strings (e.g., space variants).
+    """
     c = constraint_text.lower()
 
     try:
@@ -611,7 +640,7 @@ def compute_artifact_locally(company_name, extracted_data, constraint_text):
                 n = int(m.group(1))
                 emp = _parse_int(extracted_data.get("employees") or extracted_data.get("Q1_EMPLOYEES", ""))
                 if emp is not None:
-                    return str(emp % n), "employees_mod"
+                    return str(emp % n), "employees_mod", []
 
         # "founding_year mod N"
         if "founding" in c and "mod" in c:
@@ -620,7 +649,7 @@ def compute_artifact_locally(company_name, extracted_data, constraint_text):
                 n = int(m.group(1))
                 year = _parse_int(extracted_data.get("founded") or extracted_data.get("Q1_FOUNDED", ""))
                 if year is not None:
-                    return str(year % n), "founding_mod"
+                    return str(year % n), "founding_mod", []
 
         # "revenue_millions mod N"
         if "revenue" in c and "mod" in c:
@@ -629,7 +658,7 @@ def compute_artifact_locally(company_name, extracted_data, constraint_text):
                 n = int(m.group(1))
                 rev = _parse_revenue_to_millions(extracted_data.get("revenue") or extracted_data.get("Q1_REVENUE", ""))
                 if rev is not None:
-                    return str(rev % n), "revenue_mod"
+                    return str(rev % n), "revenue_mod", []
 
         # "margin ... mod N" or "margin × N" or "margin * N"
         if "margin" in c:
@@ -638,27 +667,33 @@ def compute_artifact_locally(company_name, extracted_data, constraint_text):
                 if "mod" in c:
                     m = re.search(r'mod\s+(\d+)', c)
                     if m:
-                        return str(margin_val % int(m.group(1))), "margin_mod"
+                        return str(margin_val % int(m.group(1))), "margin_mod", []
                 m = re.search(r'[×*]\s*(\d+)', constraint_text)  # use original case for × char
                 if m:
-                    return str(margin_val * int(m.group(1))), "margin_mul"
+                    return str(margin_val * int(m.group(1))), "margin_mul", []
                 m = re.search(r'margin\s*[–—-]\s*(\d+)', c)
                 if m:
-                    return str(margin_val - int(m.group(1))), "margin_sub"
+                    return str(margin_val - int(m.group(1))), "margin_sub", []
                 m = re.search(r'margin\s*\+\s*(\d+)', c)
                 if m:
-                    return str(margin_val + int(m.group(1))), "margin_add"
+                    return str(margin_val + int(m.group(1))), "margin_add", []
 
         # --- STRING operations ---
         # "first letter of each whitespace-delimited word"
         if "first letter of each" in c and "word" in c:
-            return ''.join(w[0] for w in company_name.split() if w), "first_letters"
+            return ''.join(w[0] for w in company_name.split() if w), "first_letters", []
 
         # "first N characters ... reversed"
         m = re.search(r'first\s+(\d+)\s+characters?.*reversed', c)
         if m:
             n = int(m.group(1))
-            return company_name[:n][::-1], "first_n_reversed"
+            # Primary: strip spaces first, then take first N reversed
+            name_ns = company_name.replace(' ', '')
+            primary = name_ns[:n][::-1]
+            # Alternate: with spaces (original behavior)
+            alt_with_spaces = company_name[:n][::-1]
+            alts = [alt_with_spaces] if alt_with_spaces != primary else []
+            return primary, "first_n_reversed", alts
 
         # "letters at 1-indexed positions X, Y, Z in the answer company's canonical name"
         m = re.search(r'positions?\s+([\d,\s]+)\s+in', c)
@@ -666,22 +701,79 @@ def compute_artifact_locally(company_name, extracted_data, constraint_text):
             m = re.search(r'positions?\s+([\d,\s]+)', c)
         if m and "letter" in c:
             positions = [int(p.strip()) for p in m.group(1).split(',') if p.strip()]
-            # Try without spaces first (coordinator likely strips spaces)
-            name_no_spaces = company_name.replace(' ', '')
-            result = []
-            for p in positions:
-                if 1 <= p <= len(name_no_spaces):
-                    result.append(name_no_spaces[p - 1])
-            if result:
-                return ''.join(result), "letter_positions"
+            name_ns = company_name.replace(' ', '')
+            alts = []
+
+            # Detect if constraint explicitly says to strip spaces
+            strip_spaces = "strip" in c and "space" in c or "space-free" in c or "spacefree" in c
+
+            if strip_spaces:
+                # Primary: no-spaces indexing (constraint explicitly says so)
+                result = []
+                valid = True
+                for p in positions:
+                    if 1 <= p <= len(name_ns):
+                        result.append(name_ns[p - 1])
+                    else:
+                        valid = False
+                        break
+                if valid and result:
+                    primary = ''.join(result)
+                    # Alt: with-spaces indexing (in case coordinator disagrees)
+                    result_ws = []
+                    valid_ws = True
+                    for p in positions:
+                        if 1 <= p <= len(company_name):
+                            result_ws.append(company_name[p - 1])
+                        else:
+                            valid_ws = False
+                            break
+                    if valid_ws and result_ws:
+                        alt = ''.join(result_ws)
+                        if alt != primary:
+                            alts.append(alt)
+                    return primary, "letter_positions", alts
+            else:
+                # No explicit strip instruction — try WITH spaces first (coordinator default)
+                result_ws = []
+                valid_ws = True
+                for p in positions:
+                    if 1 <= p <= len(company_name):
+                        result_ws.append(company_name[p - 1])
+                    else:
+                        valid_ws = False
+                        break
+
+                # Also compute no-spaces variant
+                result_ns = []
+                valid_ns = True
+                for p in positions:
+                    if 1 <= p <= len(name_ns):
+                        result_ns.append(name_ns[p - 1])
+                    else:
+                        valid_ns = False
+                        break
+
+                if valid_ws and result_ws:
+                    primary = ''.join(result_ws)
+                    if valid_ns and result_ns:
+                        alt = ''.join(result_ns)
+                        if alt != primary:
+                            alts.append(alt)
+                    return primary, "letter_positions", alts
+                elif valid_ns and result_ns:
+                    return ''.join(result_ns), "letter_positions", []
 
         # "every Nth letter" (strip spaces, 1-indexed)
         m = re.search(r'every\s+(\d+)(?:th|st|nd|rd)\s+letter', c)
         if m:
             n = int(m.group(1))
-            name_no_spaces = company_name.replace(' ', '')
-            result = ''.join(name_no_spaces[i - 1] for i in range(n, len(name_no_spaces) + 1, n))
-            return result, "every_nth"
+            name_ns = company_name.replace(' ', '')
+            primary = ''.join(name_ns[i - 1] for i in range(n, len(name_ns) + 1, n))
+            # Alt: with spaces
+            alt = ''.join(company_name[i - 1] for i in range(n, len(company_name) + 1, n))
+            alts = [alt] if alt != primary else []
+            return primary, "every_nth", alts
 
         # "employees × N" or "employees * N"
         if "employee" in c and ("×" in constraint_text or "*" in constraint_text):
@@ -690,12 +782,12 @@ def compute_artifact_locally(company_name, extracted_data, constraint_text):
                 n = int(m.group(1))
                 emp = _parse_int(extracted_data.get("employees") or extracted_data.get("Q1_EMPLOYEES", ""))
                 if emp is not None:
-                    return str(emp * n), "employees_mul"
+                    return str(emp * n), "employees_mul", []
 
     except Exception as e:
         debug_log("LOCAL_COMPUTE_ERROR", {"error": str(e), "constraint": constraint_text})
 
-    return None, None
+    return None, None, []
 
 # ============ LLM SOLVER (SINGLE-PASS + LOCAL COMPUTE) ============
 from openai import OpenAI as _OpenAI
@@ -771,7 +863,11 @@ class LLMSolver:
         return constraints[-1] if constraints else ""
 
     def solve(self, doc, questions, constraints, companies):
-        """Smart solver: deterministic first, LLM fallback."""
+        """
+        Smart solver: deterministic first, LLM fallback.
+        Returns (artifact, company, extracted_data, alternates).
+        alternates is a list of (artifact, company, extracted_data) tuples to try on rejection.
+        """
         debug_log("CHALLENGE_INPUT", {
             "doc_len": len(doc),
             "questions": questions,
@@ -782,21 +878,31 @@ class LLMSolver:
         transform_constraint = self._find_transform_constraint(constraints)
 
         # === TRY FULLY DETERMINISTIC SOLVE (no LLM, ~0.1ms) ===
-        det_company, det_data = deterministic_pass1(doc, questions, companies)
+        det_company, det_data, tied_alternates = deterministic_pass1(doc, questions, companies)
         if det_company:
-            artifact, method = compute_artifact_locally(det_company, det_data, transform_constraint)
+            artifact, method, alt_artifacts = compute_artifact_locally(det_company, det_data, transform_constraint)
             if artifact is not None:
                 log(f"⚡ DETERMINISTIC: '{artifact}' via {method} (company: {det_company})")
-                debug_log("DETERMINISTIC_OK", {"artifact": artifact, "method": method, "company": det_company, "data": det_data})
-                return artifact, det_company, det_data
+                debug_log("DETERMINISTIC_OK", {"artifact": artifact, "method": method, "company": det_company, "data": det_data,
+                                               "alt_artifacts": alt_artifacts, "tied_companies": [t[0] for t in tied_alternates]})
+
+                # Build alternates list: first space-variant alts, then tied-company alts
+                alternates = []
+                for alt_art in alt_artifacts:
+                    alternates.append((alt_art, det_company, det_data))
+                for alt_name, alt_data in tied_alternates:
+                    alt_art, alt_method, alt_art_alts = compute_artifact_locally(alt_name, alt_data, transform_constraint)
+                    if alt_art is not None:
+                        alternates.append((alt_art, alt_name, alt_data))
+                        for aa in alt_art_alts:
+                            alternates.append((aa, alt_name, alt_data))
+
+                return artifact, det_company, det_data, alternates
             else:
                 log(f"Det Pass 1 OK ({det_company}) but local compute failed, falling to LLM Pass 2")
-                # Skip LLM Pass 1, go straight to Pass 2 with det data
-                primary_company = det_company
-                extracted_data = det_data
                 validated_answers = {"Q1": det_company}
-                # Jump to Pass 2 below
-                return self._llm_pass2(doc, det_company, det_data, validated_answers, constraints)
+                result = self._llm_pass2(doc, det_company, det_data, validated_answers, constraints)
+                return result[0], result[1], result[2], []
         else:
             debug_log("DET_FALLBACK_LLM", "Deterministic parser failed, using LLM")
 
@@ -846,7 +952,7 @@ Rules:
             debug_log("PASS1_RESPONSE", pass1_content)
         except Exception as e:
             log(f"Pass 1 solver error: {e}", "ERROR")
-            return "", "", {}
+            return "", "", {}, []
 
         # Parse pass 1
         answers = {}
@@ -885,7 +991,7 @@ Rules:
         if not validated_answers:
             log("Pass 1 produced no valid answers", "WARN")
             debug_log("PASS1_PARSE_FAIL", pass1_content)
-            return "", "", {}
+            return "", "", {}, []
 
         company_counts = {}
         for v in validated_answers.values():
@@ -893,15 +999,17 @@ Rules:
         primary_company = max(company_counts, key=company_counts.get) if company_counts else ""
 
         # === TRY LOCAL COMPUTE FIRST (deterministic, 100% accurate) ===
-        artifact, method = compute_artifact_locally(primary_company, extracted_data, transform_constraint)
+        artifact, method, alt_artifacts = compute_artifact_locally(primary_company, extracted_data, transform_constraint)
 
         if artifact is not None:
             log(f"Local compute: '{artifact}' via {method}")
             debug_log("LOCAL_COMPUTE_OK", {"artifact": artifact, "method": method, "company": primary_company, "data": extracted_data})
-            return artifact, primary_company, extracted_data
+            alternates = [(a, primary_company, extracted_data) for a in alt_artifacts]
+            return artifact, primary_company, extracted_data, alternates
 
         # === FALLBACK: Pass 2 (LLM computes) ===
-        return self._llm_pass2(doc, primary_company, extracted_data, validated_answers, constraints)
+        result = self._llm_pass2(doc, primary_company, extracted_data, validated_answers, constraints)
+        return result[0], result[1], result[2], []
 
     def _llm_pass2(self, doc, primary_company, extracted_data, validated_answers, constraints):
         """LLM Pass 2: compute artifact when local compute can't handle the constraint."""
@@ -1087,7 +1195,9 @@ async def drilling_loop(bankr, coord, solver):
                 err = challenge.get("error", "unknown")
                 log(f"Drill error: {err}", "WARN")
                 if "active drill" in str(err).lower():
-                    log("Attempting to close stale drill...", "WARN")
+                    stale_attempts = getattr(state, '_stale_attempts', 0) + 1
+                    state._stale_attempts = stale_attempts
+                    log(f"Attempting to close stale drill (attempt {stale_attempts})...", "WARN")
                     try:
                         cid = challenge.get("challengeId", "")
                         if cid:
@@ -1097,9 +1207,21 @@ async def drilling_loop(bankr, coord, solver):
                                 {"type": "apply_constraint", "description": "close stale", "operation": "none", "result": "0"}
                             ]
                             await coord.submit(cid, "0", nonce, site_id, dummy_trace)
+                            state._stale_attempts = 0  # reset on success
                     except Exception:
                         pass
-                    await asyncio.sleep(10)
+                    if stale_attempts >= 3:
+                        # After 3 failed attempts, re-auth and wait longer
+                        log("Stale drill persists after 3 attempts, re-authing and waiting 60s...", "WARN")
+                        try:
+                            coord._token = None  # force re-auth
+                            await coord.ensure_auth()
+                        except Exception:
+                            pass
+                        state._stale_attempts = 0
+                        await asyncio.sleep(60)
+                    else:
+                        await asyncio.sleep(10)
                 elif "depleted" in str(err).lower():
                     _cached_sites = None  # force sites refresh
                     await asyncio.sleep(3)
@@ -1116,7 +1238,7 @@ async def drilling_loop(bankr, coord, solver):
                 state.drilled_epochs.add(challenge_epoch)
 
             # Solve
-            artifact, company, extracted = solver.solve(
+            artifact, company, extracted, alternates = solver.solve(
                 challenge.get("doc", ""),
                 challenge.get("questions", []),
                 challenge.get("constraints", []),
@@ -1150,7 +1272,10 @@ async def drilling_loop(bankr, coord, solver):
                     await asyncio.sleep(DRILL_DELAY)
                     continue
 
-            log(f"Solution: '{artifact}' (company: {company})")
+            if alternates:
+                log(f"Solution: '{artifact}' (company: {company}) [+{len(alternates)} alts]")
+            else:
+                log(f"Solution: '{artifact}' (company: {company})")
 
             # Build trace
             company_para = extracted.get("_paragraph_idx", 0)
@@ -1223,18 +1348,84 @@ async def drilling_loop(bankr, coord, solver):
 
                 state.save()
             else:
-                state.total_failures += 1
-                state.consecutive_failures += 1
                 reason = result.get("reason", str(result))
-                log(f"Rejected: {reason}", "WARN")
                 debug_log("REJECTION", {"reason": reason, "artifact": artifact, "company": company})
-                state.save()
 
-                # Circuit breaker
-                if state.consecutive_failures >= 10:
-                    log(f"10 consecutive failures! Pausing 5 min...", "ERROR")
-                    await asyncio.sleep(300)
-                    state.consecutive_failures = 0
+                # === RETRY WITH ALTERNATES ===
+                retry_accepted = False
+                if alternates:
+                    log(f"Rejected, trying {len(alternates)} alternate(s)...", "WARN")
+                    for alt_artifact, alt_company, alt_extracted in alternates:
+                        if not alt_artifact or not validate_artifact(alt_artifact):
+                            continue
+                        # Build trace for alternate
+                        alt_para = alt_extracted.get("_paragraph_idx", 0)
+                        if not alt_para:
+                            doc_text = challenge.get("doc", "")
+                            alt_paras = [p.strip() for p in doc_text.split("\n\n") if p.strip()]
+                            alt_para = 1
+                            for i, para in enumerate(alt_paras, 1):
+                                if alt_company in para:
+                                    alt_para = i
+                                    break
+                        alt_trace = [
+                            {"type": "extract_value", "paragraph": alt_para, "entity": alt_company, "field": "company_name", "value": alt_company},
+                            {"type": "extract_value", "paragraph": alt_para, "entity": alt_company, "field": "employees", "value": str(alt_extracted.get("employees", "N/A"))},
+                            {"type": "extract_value", "paragraph": alt_para, "entity": alt_company, "field": "founded", "value": str(alt_extracted.get("founded", "N/A"))},
+                            {"type": "extract_value", "paragraph": alt_para, "entity": alt_company, "field": "revenue", "value": str(alt_extracted.get("revenue", "N/A"))},
+                            {"type": "extract_value", "paragraph": alt_para, "entity": alt_company, "field": "operating_margin", "value": str(alt_extracted.get("margin", "N/A"))},
+                            {"type": "apply_constraint", "description": f"Applied constraint transformation to {alt_company}", "operation": "compute", "result": alt_artifact}
+                        ]
+                        try:
+                            alt_result = await coord.submit(
+                                challenge.get("challengeId"),
+                                alt_artifact,
+                                nonce,
+                                site_id,
+                                alt_trace
+                            )
+                        except (StaleError, RateLimitError, ServerError):
+                            break
+                        except AuthError:
+                            await coord.ensure_auth()
+                            try:
+                                alt_result = await coord.submit(challenge.get("challengeId"), alt_artifact, nonce, site_id, alt_trace)
+                            except Exception:
+                                break
+
+                        if alt_result.get("status") == "accepted":
+                            credits = alt_result.get("refinedCredits", 1)
+                            state.total_solves += 1
+                            state.total_credits += credits
+                            state.consecutive_failures = 0
+                            log(f"✅ ALT ACCEPTED! '{alt_artifact}' (company: {alt_company}) +{credits} credits (total: {state.total_credits})")
+                            if alt_result.get("gusher"):
+                                state.gushers += 1
+                                log(f"🎉 GUSHER: {alt_result['gusher']}!")
+                            tx = alt_result.get("transaction", {})
+                            if tx:
+                                await _pending_receipts.put((tx, "CRUDE drilling receipt"))
+                            state.save()
+                            retry_accepted = True
+                            break
+                        else:
+                            debug_log("ALT_REJECTION", {"artifact": alt_artifact, "company": alt_company,
+                                                        "reason": alt_result.get("reason", "?")})
+
+                if not retry_accepted:
+                    state.total_failures += 1
+                    state.consecutive_failures += 1
+                    if not alternates:
+                        log(f"Rejected: {reason}", "WARN")
+                    else:
+                        log(f"Rejected: all {len(alternates)+1} variants failed", "WARN")
+                    state.save()
+
+                    # Circuit breaker
+                    if state.consecutive_failures >= 10:
+                        log(f"10 consecutive failures! Pausing 5 min...", "ERROR")
+                        await asyncio.sleep(300)
+                        state.consecutive_failures = 0
 
             await asyncio.sleep(DRILL_DELAY)
 
@@ -1304,7 +1495,7 @@ async def monitor_loop(bankr, coord):
 # ============ MAIN ============
 async def main():
     log("=" * 60)
-    log("CRUDE Driller v5.0 - Pipeline + Local Compute")
+    log("CRUDE Driller v6.1 - Alternate Retry + Space Fixes")
     log("=" * 60)
     if DRILLER_DEBUG:
         log("DEBUG MODE ENABLED - verbose logging to crude_debug.log")
