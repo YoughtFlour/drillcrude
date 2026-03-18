@@ -1176,6 +1176,17 @@ async def drilling_loop(bankr, coord, solver):
                 log("401 on drill, re-authing...", "WARN")
                 await coord.ensure_auth()
                 challenge = await coord.drill(site_id, nonce)
+            except StaleError as e:
+                err_msg = str(e).lower()
+                if "unknown site" in err_msg or "not found" in err_msg:
+                    log(f"Site gone (epoch ended?): {e} — refreshing sites...", "WARN")
+                    _cached_sites = None  # force site refresh
+                    await asyncio.sleep(5)
+                    continue
+                else:
+                    log(f"Stale error on drill: {e}", "WARN")
+                    await asyncio.sleep(3)
+                    continue
             except ForbiddenError as e:
                 log(f"403 Forbidden: {e} — check stake level", "ERROR")
                 await asyncio.sleep(300)
