@@ -81,17 +81,45 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 ZAI_API_KEY = os.getenv("ZAI_API_KEY", "")
 
 # Timing
-DRILL_DELAY = 1  # sec between drills (was 5, reduced for pipeline mode)
+DRILL_DELAY = 0  # no delay — coordinator doesn't rate limit, network latency is enough
 CLAIM_INTERVAL = 1800  # 30 min
 MONITOR_INTERVAL = 300  # 5 min
 
 # ============ LOGGING ============
+LOG_MAX_BYTES = 10 * 1024 * 1024   # 10 MB — rotate when exceeded
+LOG_KEEP_BYTES = 5 * 1024 * 1024   # keep last 5 MB after rotation
+_log_check_counter = 0
+
+def _rotate_if_needed(filepath):
+    """Rotate log file: when >10 MB, keep only last 5 MB."""
+    global _log_check_counter
+    _log_check_counter += 1
+    if _log_check_counter % 200 != 0:  # check every ~200 writes, not every time
+        return
+    try:
+        size = os.path.getsize(filepath)
+        if size <= LOG_MAX_BYTES:
+            return
+        with open(filepath, "rb") as f:
+            f.seek(size - LOG_KEEP_BYTES)
+            tail = f.read()
+        # Find first newline to avoid partial line
+        nl = tail.find(b"\n")
+        if nl >= 0:
+            tail = tail[nl + 1:]
+        with open(filepath, "wb") as f:
+            f.write(b"[LOG ROTATED - kept last 5 MB]\n")
+            f.write(tail)
+    except Exception:
+        pass
+
 def log(msg, level="INFO"):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] [{level}] {msg}"
     print(line, flush=True)
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
+    _rotate_if_needed(LOG_FILE)
 
 def debug_log(label, data):
     """Write detailed debug data to separate file"""
@@ -105,6 +133,7 @@ def debug_log(label, data):
         else:
             f.write(str(data))
         f.write("\n")
+    _rotate_if_needed(DEBUG_LOG_FILE)
 
 # ============ EXCEPTIONS ============
 class AuthError(Exception): pass
@@ -899,7 +928,7 @@ class LLMSolver:
 
                 return artifact, det_company, det_data, alternates
             else:
-                log(f"Det Pass 1 OK ({det_company}) but local compute failed, falling to LLM Pass 2")
+                debug_log("COMPUTE_MISS", {"company": det_company, "constraint": transform_constraint, "data": {k: v for k, v in det_data.items() if not k.startswith('_')}})
                 validated_answers = {"Q1": det_company}
                 result = self._llm_pass2(doc, det_company, det_data, validated_answers, constraints)
                 return result[0], result[1], result[2], []
@@ -1013,7 +1042,7 @@ Rules:
 
     def _llm_pass2(self, doc, primary_company, extracted_data, validated_answers, constraints):
         """LLM Pass 2: compute artifact when local compute can't handle the constraint."""
-        log("Local compute failed, falling back to LLM Pass 2")
+        debug_log("LLM_PASS2", "Local compute missed, using LLM")
         answers_text = "\n".join(f"{k}: {v}" for k, v in validated_answers.items())
         data_text = "\n".join(f"{k}: {v}" for k, v in extracted_data.items())
         constraints_text = "\n".join(f"- {c}" for c in constraints)
@@ -1104,27 +1133,53 @@ def pick_best_site(sites, tier="wildcat"):
 
 # ============ BACKGROUND RECEIPT POSTER ============
 _pending_receipts = asyncio.Queue()
+_receipt_cooldown = 10  # seconds between receipt submissions to avoid in-flight limit
 
 async def receipt_poster(bankr):
-    """Background loop: posts receipts on-chain without blocking drilling"""
-    log("Receipt poster started (background)")
+    """Background loop: posts receipts on-chain, throttled to avoid in-flight tx limit"""
+    log("Receipt poster started (background, throttled)")
+    last_posted = 0
     while True:
         try:
             tx, desc = await _pending_receipts.get()
-            for attempt in range(3):
+
+            # Drain queue — keep only the LATEST receipt if multiple queued up
+            latest_tx, latest_desc = tx, desc
+            drained = 0
+            while not _pending_receipts.empty():
                 try:
-                    tx_result = await bankr.submit_tx(tx, desc)
+                    latest_tx, latest_desc = _pending_receipts.get_nowait()
+                    drained += 1
+                except asyncio.QueueEmpty:
+                    break
+            if drained:
+                debug_log("RECEIPT_DRAIN", f"Skipped {drained} stale receipts, posting latest")
+
+            # Throttle: wait until cooldown since last post
+            now = time.time()
+            wait = _receipt_cooldown - (now - last_posted)
+            if wait > 0:
+                await asyncio.sleep(wait)
+
+            for attempt in range(2):
+                try:
+                    tx_result = await bankr.submit_tx(latest_tx, latest_desc)
                     if tx_result.get("success"):
                         log(f"Receipt posted: {tx_result.get('transactionHash', '?')[:16]}...")
                     else:
-                        log(f"Receipt FAILED: {tx_result.get('error', '?')}", "ERROR")
-                    break  # success or known failure, don't retry
+                        err = tx_result.get("error", "?")
+                        if "in-flight" in str(err).lower():
+                            debug_log("RECEIPT_INFLIGHT", "In-flight limit, will retry next cycle")
+                            await asyncio.sleep(15)
+                            continue
+                        debug_log("RECEIPT_FAIL", err)
+                    break
                 except Exception as e:
-                    if attempt < 2:
-                        log(f"Receipt retry {attempt+1}/3: {e}", "WARN")
+                    if attempt < 1:
                         await asyncio.sleep(5)
                     else:
-                        log(f"Receipt dropped after 3 retries: {e}", "ERROR")
+                        debug_log("RECEIPT_DROP", str(e))
+            last_posted = time.time()
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -1204,44 +1259,92 @@ async def drilling_loop(bankr, coord, solver):
 
             if "error" in challenge:
                 err = challenge.get("error", "unknown")
+                err_lower = str(err).lower()
+                if "depleted" in err_lower:
+                    debug_log("SITE_DEPLETED", site.get('region', '?'))
+                    _cached_sites = None
+                    await asyncio.sleep(3)
+                    continue
+                elif "unavailable" in err_lower:
+                    debug_log("SITE_UNAVAILABLE", site.get('region', '?'))
+                    _cached_sites = None
+                    await asyncio.sleep(3)
+                    continue
                 log(f"Drill error: {err}", "WARN")
-                if "active drill" in str(err).lower():
-                    stale_attempts = getattr(state, '_stale_attempts', 0) + 1
-                    state._stale_attempts = stale_attempts
-                    log(f"Attempting to close stale drill (attempt {stale_attempts})...", "WARN")
-                    try:
-                        cid = challenge.get("challengeId", "")
-                        if cid:
-                            dummy_trace = [
-                                {"type": "extract_value", "paragraph": 1, "entity": "unknown", "field": "answer", "value": "0"},
-                                {"type": "extract_value", "paragraph": 1, "entity": "unknown", "field": "data", "value": "0"},
-                                {"type": "apply_constraint", "description": "close stale", "operation": "none", "result": "0"}
-                            ]
-                            await coord.submit(cid, "0", nonce, site_id, dummy_trace)
-                            state._stale_attempts = 0  # reset on success
-                    except Exception:
-                        pass
-                    if stale_attempts >= 3:
-                        # After 3 failed attempts, re-auth and wait longer
-                        log("Stale drill persists after 3 attempts, re-authing and waiting 60s...", "WARN")
+                if "active drill" in err_lower:
+                    cid = challenge.get("challengeId", "")
+                    has_doc = bool(challenge.get("doc"))
+                    debug_log("STALE_DRILL", {"challengeId": cid, "has_doc": has_doc, "keys": list(challenge.keys())})
+
+                    if cid and has_doc:
+                        # Stale drill has full challenge data — solve it properly!
+                        log("Stale drill found, solving it...", "WARN")
                         try:
-                            coord._token = None  # force re-auth
+                            stale_artifact, stale_company, stale_extracted, stale_alts = solver.solve(
+                                challenge.get("doc", ""),
+                                challenge.get("questions", []),
+                                challenge.get("constraints", []),
+                                challenge.get("companies", [])
+                            )
+                            if stale_artifact and validate_artifact(stale_artifact):
+                                stale_para = stale_extracted.get("_paragraph_idx", 1)
+                                stale_trace = [
+                                    {"type": "extract_value", "paragraph": stale_para, "entity": stale_company, "field": "company_name", "value": stale_company},
+                                    {"type": "apply_constraint", "description": "solve stale drill", "operation": "compute", "result": stale_artifact}
+                                ]
+                                stale_result = await coord.submit(cid, stale_artifact, nonce, site_id, stale_trace)
+                                if stale_result.get("status") == "accepted":
+                                    credits = stale_result.get("refinedCredits", 1)
+                                    state.total_solves += 1
+                                    state.total_credits += credits
+                                    log(f"Stale drill solved! +{credits} credits (total: {state.total_credits})")
+                                    tx = stale_result.get("transaction", {})
+                                    if tx:
+                                        await _pending_receipts.put((tx, "CRUDE drilling receipt"))
+                                    state.save()
+                                else:
+                                    debug_log("STALE_REJECTED", stale_result.get("reason", "?"))
+                                continue  # drill closed, move on
+                            else:
+                                # Can't solve — submit dummy to close it
+                                dummy_trace = [{"type": "apply_constraint", "description": "close stale", "operation": "none", "result": "0"}]
+                                await coord.submit(cid, "0", nonce, site_id, dummy_trace)
+                                continue
+                        except Exception as e:
+                            debug_log("STALE_SOLVE_ERR", str(e))
+                    elif cid:
+                        # Has challengeId but no doc — just submit dummy to close
+                        try:
+                            dummy_trace = [{"type": "apply_constraint", "description": "close stale", "operation": "none", "result": "0"}]
+                            await coord.submit(cid, "0", nonce, site_id, dummy_trace)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(2)
+                    else:
+                        # No challengeId — coordinator won't give us the drill data
+                        # Escalate wait: the stale drill will expire on coordinator side
+                        no_cid_attempts = getattr(state, '_no_cid_attempts', 0) + 1
+                        state._no_cid_attempts = no_cid_attempts
+                        if no_cid_attempts == 1:
+                            log("Stale drill (no challengeId), waiting for expiry...", "WARN")
+                        wait_secs = min(30 * no_cid_attempts, 120)  # 30, 60, 90, 120 max
+                        debug_log("STALE_NO_CID", f"attempt {no_cid_attempts}, waiting {wait_secs}s")
+                        try:
+                            coord._token = None
                             await coord.ensure_auth()
                         except Exception:
                             pass
-                        state._stale_attempts = 0
-                        await asyncio.sleep(60)
-                    else:
-                        await asyncio.sleep(10)
-                elif "depleted" in str(err).lower():
-                    _cached_sites = None  # force sites refresh
-                    await asyncio.sleep(3)
+                        await asyncio.sleep(wait_secs)
+                        if no_cid_attempts >= 5:
+                            log("Stale drill won't clear after 5 attempts, continuing anyway...", "WARN")
+                            state._no_cid_attempts = 0
                 else:
                     await asyncio.sleep(5)
                 continue
 
-            # Reset retry counter on successful drill
+            # Reset retry counters on successful drill
             retry_attempt = 0
+            state._no_cid_attempts = 0
 
             # Track epoch
             challenge_epoch = challenge.get("epochId") or epoch_id
@@ -1256,20 +1359,30 @@ async def drilling_loop(bankr, coord, solver):
                 challenge.get("companies", [])
             )
 
+            # Helper: close drill with dummy submit so it doesn't stay "active"
+            async def _close_drill(reason):
+                try:
+                    cid = challenge.get("challengeId", "")
+                    if cid:
+                        dummy_trace = [{"type": "apply_constraint", "description": reason, "operation": "none", "result": "0"}]
+                        await coord.submit(cid, "0", nonce, site_id, dummy_trace)
+                except Exception:
+                    pass
+
             # Skip if artifact is empty
             if not artifact:
-                log("Solver returned empty artifact, skipping", "WARN")
+                debug_log("EMPTY_ARTIFACT", "Solver returned empty")
                 state.total_failures += 1
                 state.save()
-                await asyncio.sleep(DRILL_DELAY)
+                await _close_drill("empty artifact")
                 continue
 
             # Validate artifact
             if not validate_artifact(artifact):
-                log(f"Artifact contains reasoning markers: {artifact[:80]}...", "WARN")
+                debug_log("REASONING_MARKERS", artifact[:120])
                 state.total_failures += 1
                 state.save()
-                await asyncio.sleep(DRILL_DELAY)
+                await _close_drill("invalid artifact")
                 continue
 
             # Pre-validate company exists in list
@@ -1277,10 +1390,10 @@ async def drilling_loop(bankr, coord, solver):
             if company and companies_list:
                 companies_lower = {c.lower() for c in companies_list}
                 if company.lower() not in companies_lower:
-                    log(f"Company '{company}' not in valid list, skipping submit", "WARN")
+                    debug_log("COMPANY_MISMATCH", {"company": company, "valid": list(companies_list)})
                     state.total_failures += 1
                     state.save()
-                    await asyncio.sleep(DRILL_DELAY)
+                    await _close_drill("company mismatch")
                     continue
 
             if alternates:
@@ -1365,7 +1478,7 @@ async def drilling_loop(bankr, coord, solver):
                 # === RETRY WITH ALTERNATES ===
                 retry_accepted = False
                 if alternates:
-                    log(f"Rejected, trying {len(alternates)} alternate(s)...", "WARN")
+                    debug_log("RETRY_ALTS", f"Primary rejected, trying {len(alternates)} alternate(s)")
                     for alt_artifact, alt_company, alt_extracted in alternates:
                         if not alt_artifact or not validate_artifact(alt_artifact):
                             continue
@@ -1426,10 +1539,7 @@ async def drilling_loop(bankr, coord, solver):
                 if not retry_accepted:
                     state.total_failures += 1
                     state.consecutive_failures += 1
-                    if not alternates:
-                        log(f"Rejected: {reason}", "WARN")
-                    else:
-                        log(f"Rejected: all {len(alternates)+1} variants failed", "WARN")
+                    debug_log("REJECTED", {"reason": reason, "alts_tried": len(alternates) if alternates else 0})
                     state.save()
 
                     # Circuit breaker
