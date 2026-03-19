@@ -17,6 +17,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+os.environ["STAKE_TIER"] = "wildcat"
+os.environ["DRILLER_MAX_DEPTH"] = "shallow"
 # Load .env file if exists
 _env_file = Path(__file__).parent / ".env"
 if _env_file.exists():
@@ -1939,6 +1941,7 @@ async def monitor_loop(bankr, coord):
 
 # ============ MAIN ============
 async def main():
+    
     log("=" * 60)
     log("CRUDE Driller v6.4 - Shallow preference + crash fixes")
     log("=" * 60)
