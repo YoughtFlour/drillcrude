@@ -1201,7 +1201,7 @@ async def drilling_loop(bankr, coord, solver):
 
             # Cache sites for 10 seconds to avoid redundant API calls
             now = time.time()
-            if _cached_sites is None or now - _sites_ts > 10:
+            if _cached_sites is None or now - _sites_ts > 15:
                 sites_data = await coord.get_sites()
                 _cached_sites = sites_data.get("sites", [])
                 epoch_id = sites_data.get("epochId")
