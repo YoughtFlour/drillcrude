@@ -1,12 +1,13 @@
-# CRUDE Driller v6.0
+# CRUDE Driller v6.2
 
 Автоматический бот для майнинга $CRUDE токенов на Base через [drillcrude.com](https://www.drillcrude.com).
 
 ## Что делает
 
-Три параллельных async loop:
+Параллельные async loop:
 
-- **Drilling** — основной цикл: auth → выбор сайта → получение challenge → **детерминистическое решение** → submit → post receipt on-chain (~1 сек/цикл)
+- **Drilling** — основной цикл: auth → выбор лучшего сайта → получение challenge → **детерминистическое решение** → submit → repeat (~1 сек/цикл)
+- **Receipt poster** — фоновый постинг receipt-ов на чейн, throttled (1 per 10 sec) для избежания in-flight лимитов
 - **Claiming** — каждые 30 мин проверяет завершённые эпохи и клеймит награды
 - **Monitoring** — каждые 5 мин логирует статистику (solve rate, credits, gushers)
 
@@ -18,10 +19,11 @@
 2. Классифицирует вопрос → определяет поле и направление (highest revenue, fewest employees, etc.)
 3. Выбирает компанию алгоритмически → `max()`/`min()` по нужному полю
 4. Вычисляет артифакт в Python → `mod`, `letter_positions`, `first_n_reversed`, etc.
+5. При реджекте — пробует альтернативные варианты (другой кандидат, с/без пробелов)
 
-**Результат:** ~70-80% hit rate, ~1 сек/цикл, 0 затрат на API.
+**Результат:** ~73% hit rate, ~1 сек/цикл, 0 затрат на API.
 
-LLM используется только как fallback для неизвестных типов вопросов.
+LLM используется только как fallback для неизвестных типов вопросов (GLM-5 бесплатно).
 
 ## Требования
 
@@ -85,8 +87,8 @@ DRILLER_DEBUG=true screen -dmS driller python3 crude_driller.py
 
 ```
 Challenge → deterministic_pass1() → compute_artifact_locally() → submit
-                   ↓ (fail)
-              LLM Pass 1 → local compute → submit
+                   ↓ (fail)                                        ↓ (rejected)
+              LLM Pass 1 → local compute → submit              try alternates
                                ↓ (fail)
                           LLM Pass 2 → submit
 ```
@@ -95,6 +97,7 @@ Challenge → deterministic_pass1() → compute_artifact_locally() → submit
 - `parse_companies()` — regex-парсинг документа
 - `parse_question()` — классификация типа вопроса
 - `compute_artifact_locally()` — вычисление артифакта в Python
+- **Alt-retry** — при реджекте пробует альтернативы (дубликаты, пробелы/без пробелов)
 
 **LLM fallback** (для неизвестных типов):
 - Pass 1: LLM извлекает компанию + данные
@@ -113,6 +116,18 @@ Challenge → deterministic_pass1() → compute_artifact_locally() → submit
 | letter positions | `positions 2,5,8` → extract chars | `letter_positions` |
 | every Nth letter | `every 3rd letter` → extract | `every_nth` |
 
+## Типы сайтов
+
+| Тип | Множитель кредитов | Описание |
+|---|---|---|
+| standard | 1× | Базовые кредиты |
+| rich | 4× | Повышенная награда |
+| bonanza | 5× | Максимальная награда |
+
+Плюс случайные бонусы: gusher (3×), mega-gusher (10×).
+
+Сайты истощаются со временем и регенерируют. Бот автоматически выбирает лучший доступный.
+
 ## Staking tiers
 
 | Tier | Стейк | Credits/solve | Доступ |
@@ -125,21 +140,29 @@ Challenge → deterministic_pass1() → compute_artifact_locally() → submit
 
 | Файл | Описание |
 |---|---|
-| `crude_driller.py` | Основной скрипт |
+| `crude_driller.py` | Основной скрипт (~1600 строк) |
+| `claim_now.py` | Ручной клейм наград |
 | `.env` | Конфигурация (не коммитить!) |
-| `crude_driller.log` | Основной лог |
-| `crude_debug.log` | Debug: challenges + парсинг |
-| `crude_driller_state.json` | Персистентное состояние |
-| `crude_driller.pid` | Lock-файл (single instance) |
+| `crude_driller.log` | Основной лог (accepts, gushers, warnings) |
+| `crude_debug.log` | Debug-лог (receipt fails, парсинг, stale drills) |
+| `crude_state.json` | Персистентное состояние |
+
+Логи авто-ротируются при >10 МБ (остаётся последние 5 МБ).
 
 ## Troubleshooting
 
-**"Miner already has an active drill request"** — предыдущий drill не завершён. Скрипт автоматически пробует закрыть, ждёт ~1-2 мин.
+**"Miner already has an active drill request"** — предыдущий drill не завершён. v6.2 автоматически решает stale challenge или закрывает его dummy-сабмитом.
 
 **"Artifact did not satisfy deterministic constraints"** — парсер извлёк неправильное число или выбрал не ту компанию. Включи `DRILLER_DEBUG=true` и проверь `crude_debug.log`.
-
-**"Receipt FAILED: in-flight transaction limit"** — on-chain receipt не успевает за скоростью solver-а. Кредиты всё равно засчитываются координатором.
 
 **Auth 502 errors** — координатор временно недоступен. Скрипт retry-ит с backoff до 10 попыток.
 
 **"DET_QUESTION_UNKNOWN"** в debug логе — встретился новый тип вопроса. Бот упадёт в LLM fallback. Добавь паттерн в `_QUESTION_MAP`.
+
+## Версии
+
+| Версия | Что нового |
+|---|---|
+| v6.0 | Deterministic solver — без LLM для 95% challenges |
+| v6.1 | Alt-retry при реджекте + фиксы пробелов |
+| v6.2 | Throttled receipts, stale drill fix, авто-ротация логов, чистые логи |
