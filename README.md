@@ -47,12 +47,32 @@ DRILLER_ADDRESS=твой_кошелёк_на_Base
 - `BANKR_API_KEY` — зарегистрируйся на [bankr.bot/api](https://bankr.bot/api), включи **Agent API** и **отключи read-only**
 - `DRILLER_ADDRESS` — твой EVM-кошелёк на Base (можно оставить пустым — определится автоматически)
 
+**Важно — укажи свой тир стейкинга:**
+```env
+DRILLER_TIER=platform       # wildcat (25M) / platform (50M) / deepwater (100M)
+```
+Если застейкано 25M — ставь `wildcat`, 50M — `platform`, 100M — `deepwater`. По умолчанию `platform`.
+
 **Опционально:**
 ```env
 DRILLER_DEBUG=true          # подробные логи
 DRILLER_QUIET=true          # минимальный вывод (только accepts и ошибки)
 LLM_BACKEND=zai             # zai (бесплатно) или openrouter
 ZAI_API_KEY=ключ            # только для LLM fallback
+TELEGRAM_BOT_TOKEN=токен    # уведомления в Telegram (см. ниже)
+TELEGRAM_CHAT_ID=id         # ID чата для уведомлений
+```
+
+**Telegram-уведомления (опционально):**
+
+Бот может отправлять уведомления о гашерах, ошибках и статистике в Telegram.
+
+1. Открой [@BotFather](https://t.me/BotFather) в Telegram, отправь `/newbot`, следуй инструкциям — получишь токен
+2. Напиши своему боту любое сообщение, затем открой `https://api.telegram.org/bot<ТВОЙ_ТОКЕН>/getUpdates` — найди `"chat":{"id":123456789}` — это твой chat ID
+3. Добавь в `.env`:
+```env
+TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
+TELEGRAM_CHAT_ID=123456789
 ```
 
 ### 4. Подготовь кошелёк
@@ -114,6 +134,7 @@ screen -dmS driller bash -c 'cd ~/driller && source venv/bin/activate && python3
 | Ошибка | Что делать |
 |---|---|
 | `Drill cooldown active` | Всё ок — бот ждёт 30 сек автоматически |
+| `wildcat rig cannot access medium wells` | Неправильный `DRILLER_TIER` в `.env`. Если 25M стейк — ставь `wildcat` |
 | `Miner is not eligible` | Проверь стейк. Если есть pending unstake — отмени его |
 | `Auth 502` | Координатор временно лежит. Бот retry-ит сам |
 | `Trace must reference the constraint company` | Не та компания — alt-retry попробует другие |
@@ -122,7 +143,7 @@ screen -dmS driller bash -c 'cd ~/driller && source venv/bin/activate && python3
 
 | Версия | Что нового |
 |---|---|
-| v6.7 | Decimal-парсинг revenue, suffix-stripped name alts, async receipts, убран лишний wait |
+| v6.7 | Decimal-парсинг revenue, suffix-stripped name alts, async receipts, настраиваемый тир (`DRILLER_TIER`) |
 | v6.6 | Black Gold events (blowout/jackpot), Epoch 4 фичи, bonus tracking |
 | v6.5 | Новый trace формат, inline receipts, 30s cooldown, alt-retry работает |
 | v6.4 | I/O оптимизации, VPS support |

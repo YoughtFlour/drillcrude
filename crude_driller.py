@@ -90,6 +90,16 @@ DRILL_DELAY_INIT = float(os.environ.get("DRILL_DELAY", "1.0"))  # minimal — re
 CLAIM_INTERVAL = 1800  # 30 min
 MONITOR_INTERVAL = 300  # 5 min
 
+# Telegram notifications (optional)
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# Staking tier (wildcat=25M/1cr, platform=50M/2cr, deepwater=100M/3cr)
+DRILLER_TIER = os.getenv("DRILLER_TIER", "platform").lower().strip()
+TIER_CREDITS = {"wildcat": 1, "platform": 2, "deepwater": 3}
+if DRILLER_TIER not in TIER_CREDITS:
+    DRILLER_TIER = "platform"  # safe fallback
+
 # ============ LOGGING (buffered I/O) ============
 LOG_MAX_BYTES = 10 * 1024 * 1024   # 10 MB — rotate when exceeded
 LOG_KEEP_BYTES = 5 * 1024 * 1024   # keep last 5 MB after rotation
@@ -181,6 +191,51 @@ def debug_log(label, data):
     now = time.time()
     if now - _debug_flush_ts >= _DEBUG_FLUSH_INTERVAL:
         _flush_debug()
+
+# ============ TELEGRAM NOTIFICATIONS ============
+_tg_session = None
+_tg_error_ts = 0  # rate-limit error notifications
+
+async def tg_init():
+    """Create shared session for Telegram notifications."""
+    global _tg_session
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        _tg_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=10)
+        )
+
+async def tg_close():
+    """Close Telegram session."""
+    global _tg_session
+    if _tg_session:
+        await _tg_session.close()
+        _tg_session = None
+
+async def tg_notify(msg, silent=False):
+    """Send Telegram notification. Non-blocking, never raises."""
+    if not _tg_session:
+        return
+    try:
+        await _tg_session.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": msg,
+                "parse_mode": "HTML",
+                "disable_notification": silent
+            }
+        )
+    except Exception:
+        pass  # TG down — ignore, don't break drilling
+
+async def tg_error(msg):
+    """Send error notification with 5-min cooldown to prevent spam."""
+    global _tg_error_ts
+    now = time.time()
+    if now - _tg_error_ts < 300:  # 5 min cooldown
+        return
+    _tg_error_ts = now
+    await tg_notify(msg)
 
 # ============ EXCEPTIONS ============
 class AuthError(Exception): pass
@@ -1473,8 +1528,8 @@ def _site_ev_score(site, featured_region=None):
         except (ValueError, TypeError):
             pass
 
-    # Base credits × richness (Platform tier = 2)
-    ev = 2.0 * richness_mult
+    # Base credits × richness (tier-dependent)
+    ev = float(TIER_CREDITS.get(DRILLER_TIER, 2)) * richness_mult
 
     # Featured basin bonus (+1 credit)
     if featured_region and site.get("region", "").lower() == featured_region.lower():
@@ -1588,7 +1643,7 @@ async def drilling_loop(bankr, coord, solver):
                 _sites_ts = now
 
                 if _cached_sites:
-                    counts = _count_sites_by_richness(_cached_sites, "platform")
+                    counts = _count_sites_by_richness(_cached_sites, DRILLER_TIER)
                     summary = [{"region": s.get("region", "?"), "depth": s.get("estimatedDepth", "?"),
                                 "richness": s.get("richness") or s.get("reserveEstimate", "?"),
                                 "depletion": s.get("depletionPct", "?")} for s in _cached_sites]
@@ -1598,7 +1653,7 @@ async def drilling_loop(bankr, coord, solver):
                         sites_logged = True
 
             # Pick best site — maximize expected credits
-            site = pick_best_site(_cached_sites, tier="platform", featured_region=_featured_region)
+            site = pick_best_site(_cached_sites, tier=DRILLER_TIER, featured_region=_featured_region)
             if not site:
                 log("No valid sites, waiting 30s...")
                 _cached_sites = None  # force refresh next time
@@ -1928,12 +1983,20 @@ async def drilling_loop(bankr, coord, solver):
                 if result.get("blowout"):
                     burn_amt = result.get("blowoutBurnAmount", "?")
                     bonus_parts.append(f"🔥BLOWOUT({burn_amt} burned)")
+                    asyncio.create_task(tg_notify(
+                        f"🔥 <b>BLOWOUT!</b> {burn_amt} burned\n"
+                        f"Credits OK. Total: {state.total_credits}"
+                    ))
                 jackpot = result.get("jackpot", {})
                 if jackpot.get("triggered"):
                     jp_credits = jackpot.get("bonusCredits", 0)
                     jp_reserve = jackpot.get("reserveAmount", "?")
                     bonus_parts.append(f"💎JACKPOT+{jp_credits}")
                     log(f"💎💎💎 JACKPOT ERUPTION! +{jp_credits} bonus credits! Reserve: {jp_reserve}")
+                    asyncio.create_task(tg_notify(
+                        f"💎 <b>JACKPOT ERUPTION!</b>\n"
+                        f"+{jp_credits} bonus credits! Reserve: {jp_reserve}"
+                    ))
                 bonus_str = f" ({', '.join(bonus_parts)})" if bonus_parts else ""
                 log(f"✅ ACCEPTED! +{credits} credits{bonus_str} (total: {state.total_credits})")
 
@@ -2019,10 +2082,16 @@ async def drilling_loop(bankr, coord, solver):
                                 alt_bonus.append(f"💥depletion+{alt_bd['depletionBonus']}")
                             if alt_result.get("blowout"):
                                 alt_bonus.append(f"🔥BLOWOUT({alt_result.get('blowoutBurnAmount', '?')} burned)")
+                                asyncio.create_task(tg_notify(
+                                    f"🔥 <b>BLOWOUT!</b> {alt_result.get('blowoutBurnAmount', '?')} burned"
+                                ))
                             alt_jp = alt_result.get("jackpot", {})
                             if alt_jp.get("triggered"):
                                 alt_bonus.append(f"💎JACKPOT+{alt_jp.get('bonusCredits', 0)}")
                                 log(f"💎💎💎 JACKPOT ERUPTION! +{alt_jp.get('bonusCredits', 0)} bonus credits!")
+                                asyncio.create_task(tg_notify(
+                                    f"💎 <b>JACKPOT!</b> +{alt_jp.get('bonusCredits', 0)} bonus credits!"
+                                ))
                             alt_bonus_str = f" ({', '.join(alt_bonus)})" if alt_bonus else ""
                             log(f"✅ ALT ACCEPTED! '{alt_artifact}' (company: {alt_company}) +{credits} credits{alt_bonus_str} (total: {state.total_credits})")
                             tx = alt_result.get("transaction", {})
@@ -2042,9 +2111,16 @@ async def drilling_loop(bankr, coord, solver):
                     debug_log("REJECTED", {"reason": reason, "alts_tried": len(alternates) if alternates else 0})
                     state.save()
 
+                    # Telegram: alert on 5 consecutive failures (once)
+                    if state.consecutive_failures == 5:
+                        asyncio.create_task(tg_notify(
+                            f"⚠️ <b>5 rejects подряд!</b>\n{reason[:100]}"
+                        ))
+
                     # Circuit breaker
                     if state.consecutive_failures >= 10:
                         log(f"10 consecutive failures! Pausing 30s...", "WARN")
+                        asyncio.create_task(tg_notify(f"🔴 <b>10 rejects подряд!</b> Пауза 30s"))
                         await asyncio.sleep(30)
                         state.consecutive_failures = 0
 
@@ -2052,6 +2128,7 @@ async def drilling_loop(bankr, coord, solver):
             raise
         except Exception as e:
             log(f"Drilling error: {e}", "ERROR")
+            asyncio.create_task(tg_error(f"🔴 <b>Error:</b> {str(e)[:150]}"))
             await backoff_sleep(retry_attempt, base=5.0)
             retry_attempt = min(retry_attempt + 1, 5)
 
@@ -2077,6 +2154,11 @@ async def claim_loop(bankr, coord):
                     result = await bankr.submit_tx(tx, f"Claim CRUDE epoch {prev_epoch}")
                     if result.get("success"):
                         log(f"Claimed epoch {prev_epoch}: {result.get('transactionHash', '?')[:16]}...")
+                        asyncio.create_task(tg_notify(
+                            f"💸 <b>Claimed epoch {prev_epoch}</b>\n"
+                            f"{result.get('transactionHash', '?')[:16]}...",
+                            silent=True
+                        ))
                         state.drilled_epochs.discard(prev_epoch)
                         state.save()
                     else:
@@ -2090,6 +2172,7 @@ async def claim_loop(bankr, coord):
 async def monitor_loop(bankr, coord):
     """Monitor stats every 5 min"""
     log("Monitor loop started")
+    tg_report_count = 0
 
     while True:
         try:
@@ -2103,6 +2186,18 @@ async def monitor_loop(bankr, coord):
             rate = (state.total_solves / total * 100) if total > 0 else 0
 
             log(f"Stats: {state.total_solves}/{total} ({rate:.1f}%) | {state.total_credits} credits | {state.gushers} gushers | {hours}h{mins}m")
+
+            # Telegram hourly report
+            tg_report_count += 1
+            if tg_report_count % 12 == 0:  # every hour (12 × 5 min)
+                credits_hr = int(state.total_credits / max(runtime, 1) * 3600)
+                await tg_notify(
+                    f"🛢 <b>Hourly</b> — {hours}h{mins}m\n"
+                    f"📊 {state.total_solves}/{total} ({rate:.1f}%)\n"
+                    f"💰 {state.total_credits} cr ({credits_hr}/hr)\n"
+                    f"🎉 {state.gushers} gushers",
+                    silent=True
+                )
 
             # Per-site-type stats
             if state.site_stats:
@@ -2148,9 +2243,11 @@ async def main():
     coord = CoordinatorClient(COORDINATOR_URL, DRILLER_ADDRESS, bankr)
     solver = LLMSolver(LLM_BACKEND, LLM_MODEL, OPENROUTER_API_KEY, ZAI_API_KEY)
     log(f"LLM: {LLM_MODEL} via {LLM_BACKEND}")
+    log(f"Rig tier: {DRILLER_TIER} ({TIER_CREDITS[DRILLER_TIER]} credits/solve)")
 
     await bankr.init()
     await coord.init()
+    await tg_init()
 
     # Initial auth (retry until success)
     for attempt in range(10):
@@ -2166,6 +2263,11 @@ async def main():
             else:
                 log("Auth failed after 10 attempts, exiting", "ERROR")
                 return
+
+    await tg_notify(
+        f"🟢 <b>CRUDE Driller v6.7 started</b>\n"
+        f"⛏ {DRILLER_ADDRESS[:8]}...{DRILLER_ADDRESS[-4:]}"
+    )
 
     shutdown_event = asyncio.Event()
 
@@ -2185,6 +2287,12 @@ async def main():
         pass
     finally:
         log("Shutting down...")
+        runtime = int(time.time() - state.start_time)
+        await tg_notify(
+            f"🔴 <b>Driller stopped</b> — {runtime//3600}h{(runtime%3600)//60}m\n"
+            f"💰 {state.total_credits} credits | {state.total_solves} solves"
+        )
+        await tg_close()
         state.save(force=True)
         _flush_log()
         _flush_debug()
