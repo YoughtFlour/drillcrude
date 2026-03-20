@@ -100,6 +100,14 @@ TIER_CREDITS = {"wildcat": 1, "platform": 2, "deepwater": 3}
 if DRILLER_TIER not in TIER_CREDITS:
     DRILLER_TIER = "platform"  # safe fallback
 
+# Staking amounts (wei = tokens * 10^18)
+TIER_STAKE_WEI = {
+    "wildcat":  "25000000000000000000000000",
+    "platform": "50000000000000000000000000",
+    "deepwater":"100000000000000000000000000",
+}
+TIER_STAKE_DISPLAY = {"wildcat": "25M", "platform": "50M", "deepwater": "100M"}
+
 # ============ LOGGING (buffered I/O) ============
 LOG_MAX_BYTES = 10 * 1024 * 1024   # 10 MB — rotate when exceeded
 LOG_KEEP_BYTES = 5 * 1024 * 1024   # keep last 5 MB after rotation
@@ -518,6 +526,83 @@ class CoordinatorClient:
         epoch_str = ",".join(map(str, epochs))
         async with self.session.get(f"{self.url}/v1/claim-calldata?epochs={epoch_str}") as resp:
             return await resp.json()
+
+    async def get_stake_approve_calldata(self, amount_wei):
+        async with self.session.get(
+            f"{self.url}/v1/stake-approve-calldata?amount={amount_wei}"
+        ) as resp:
+            return await resp.json()
+
+    async def get_stake_calldata(self, amount_wei):
+        async with self.session.get(
+            f"{self.url}/v1/stake-calldata?amount={amount_wei}"
+        ) as resp:
+            return await resp.json()
+
+
+async def _offer_auto_stake(bankr, coord):
+    """Called on first 403 in drilling_loop — offer interactive staking."""
+    tier = DRILLER_TIER
+    amount_display = TIER_STAKE_DISPLAY[tier]
+    amount_wei = TIER_STAKE_WEI[tier]
+
+    log(f"{'='*50}")
+    log(f"⚠️  Stake required: {amount_display} $CRUDE ({tier} tier)")
+    log(f"    Auto-stake now? (y/n)")
+    log(f"{'='*50}")
+
+    try:
+        answer = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: input(">>> Stake? (y/n): ").strip().lower()
+        )
+    except (EOFError, KeyboardInterrupt):
+        log("Headless mode — auto-stake unavailable. Stake manually via drillcrude.com", "WARN")
+        return False
+
+    if answer not in ("y", "yes"):
+        log("Staking cancelled by user.")
+        return False
+
+    # Step 1: Approve
+    log(f"Approving {amount_display} $CRUDE for staking...")
+    try:
+        approve_data = await coord.get_stake_approve_calldata(amount_wei)
+        tx = approve_data.get("transaction")
+        if not tx:
+            log(f"Approve calldata error: {approve_data}", "ERROR")
+            return False
+        result = await bankr.submit_tx(tx, f"Approve {amount_display} CRUDE for staking")
+        if not result.get("success"):
+            log(f"Approve tx failed: {result}", "ERROR")
+            return False
+        log(f"✅ Approve OK: {result.get('transactionHash', '?')[:16]}...")
+    except Exception as e:
+        log(f"Approve failed: {e}", "ERROR")
+        return False
+
+    # Step 2: Stake
+    log(f"Staking {amount_display} $CRUDE...")
+    try:
+        stake_data = await coord.get_stake_calldata(amount_wei)
+        tx = stake_data.get("transaction")
+        if not tx:
+            log(f"Stake calldata error: {stake_data}", "ERROR")
+            return False
+        result = await bankr.submit_tx(tx, f"Stake {amount_display} CRUDE")
+        if not result.get("success"):
+            log(f"Stake tx failed: {result}", "ERROR")
+            if tier != "wildcat":
+                log(f"💡 Try DRILLER_TIER=wildcat (only 25M $CRUDE needed)", "WARN")
+            return False
+        log(f"✅ Staked {amount_display} $CRUDE! Hash: {result.get('transactionHash', '?')[:16]}...")
+        await tg_notify(f"⛏ <b>Staked {amount_display} $CRUDE</b> ({tier} tier)")
+        return True
+    except Exception as e:
+        log(f"Stake failed: {e}", "ERROR")
+        if tier != "wildcat":
+            log(f"💡 Insufficient funds? Try DRILLER_TIER=wildcat (25M)", "WARN")
+        return False
+
 
 # ============ DETERMINISTIC DOCUMENT PARSER (NO LLM) ============
 import dataclasses
@@ -1336,11 +1421,18 @@ class LLMSolver:
                 return artifact, det_company, det_data, alternates
             else:
                 debug_log("COMPUTE_MISS", {"company": det_company, "constraint": transform_constraint, "data": {k: v for k, v in det_data.items() if not k.startswith('_')}})
+                if not hasattr(self, 'client') or self.client is None:
+                    debug_log("NO_LLM", "LLM disabled, cannot fallback")
+                    return "", "", {}, []
                 validated_answers = {"Q1": det_company}
                 result = self._llm_pass2(doc, det_company, det_data, validated_answers, constraints)
                 return result[0], result[1], result[2], []
         else:
             debug_log("DET_FALLBACK_LLM", "Deterministic parser failed, using LLM")
+
+        if not hasattr(self, 'client') or self.client is None:
+            debug_log("NO_LLM", "LLM disabled, deterministic failed — skipping challenge")
+            return "", "", {}, []
 
         # === LLM FALLBACK PATH ===
         q_text = "\n".join(f"Q{i+1}: {q}" for i, q in enumerate(questions))
@@ -1545,8 +1637,7 @@ def _site_ev_score(site, featured_region=None):
 def pick_best_site(sites, tier="wildcat", featured_region=None, min_richness=None):
     """Pick best site by expected credit value.
     min_richness: if set ('rich'/'bonanza'), skip standard sites."""
-    tier = "wildcat"
-    allowed = ["shallow"]
+    allowed = ["shallow", "medium"]
 
     valid = [s for s in sites
              if s.get("estimatedDepth") in allowed
@@ -1692,7 +1783,14 @@ async def drilling_loop(bankr, coord, solver):
                     await asyncio.sleep(3)
                     continue
             except ForbiddenError as e:
-                log(f"403 Forbidden: {e} — check stake level", "ERROR")
+                log(f"403 Forbidden: {e}", "ERROR")
+                if not getattr(state, '_stake_offered', False):
+                    state._stake_offered = True
+                    staked = await _offer_auto_stake(bankr, coord)
+                    if staked:
+                        log("Stake successful — resuming drilling...")
+                        continue
+                log("Check stake level. Waiting 5 min...", "WARN")
                 await asyncio.sleep(300)
                 continue
             except RateLimitError as e:
@@ -1983,10 +2081,11 @@ async def drilling_loop(bankr, coord, solver):
                 if result.get("blowout"):
                     burn_amt = result.get("blowoutBurnAmount", "?")
                     bonus_parts.append(f"🔥BLOWOUT({burn_amt} burned)")
-                    asyncio.create_task(tg_notify(
-                        f"🔥 <b>BLOWOUT!</b> {burn_amt} burned\n"
-                        f"Credits OK. Total: {state.total_credits}"
-                    ))
+                    if str(burn_amt) not in ("0", "0.0", "?"):
+                        asyncio.create_task(tg_notify(
+                            f"🔥 <b>BLOWOUT!</b> {burn_amt} burned\n"
+                            f"Credits OK. Total: {state.total_credits}"
+                        ))
                 jackpot = result.get("jackpot", {})
                 if jackpot.get("triggered"):
                     jp_credits = jackpot.get("bonusCredits", 0)
@@ -2081,10 +2180,12 @@ async def drilling_loop(bankr, coord, solver):
                             if alt_bd.get("depletionBonus"):
                                 alt_bonus.append(f"💥depletion+{alt_bd['depletionBonus']}")
                             if alt_result.get("blowout"):
-                                alt_bonus.append(f"🔥BLOWOUT({alt_result.get('blowoutBurnAmount', '?')} burned)")
-                                asyncio.create_task(tg_notify(
-                                    f"🔥 <b>BLOWOUT!</b> {alt_result.get('blowoutBurnAmount', '?')} burned"
-                                ))
+                                alt_burn = alt_result.get('blowoutBurnAmount', '?')
+                                alt_bonus.append(f"🔥BLOWOUT({alt_burn} burned)")
+                                if str(alt_burn) not in ("0", "0.0", "?"):
+                                    asyncio.create_task(tg_notify(
+                                        f"🔥 <b>BLOWOUT!</b> {alt_burn} burned"
+                                    ))
                             alt_jp = alt_result.get("jackpot", {})
                             if alt_jp.get("triggered"):
                                 alt_bonus.append(f"💎JACKPOT+{alt_jp.get('bonusCredits', 0)}")
@@ -2230,19 +2331,29 @@ async def main():
         missing.append("BANKR_API_KEY")
     if not DRILLER_ADDRESS:
         missing.append("DRILLER_ADDRESS")
-    if LLM_BACKEND == "openrouter" and not OPENROUTER_API_KEY:
-        missing.append("OPENROUTER_API_KEY")
-    if LLM_BACKEND == "zai" and not ZAI_API_KEY:
-        missing.append("ZAI_API_KEY")
     if missing:
         log(f"Missing required config: {', '.join(missing)}", "ERROR")
         log("Copy .env.example to .env and fill in your values", "ERROR")
         return
 
+    # LLM is optional — 95%+ challenges solved deterministically
+    llm_ok = False
+    if LLM_BACKEND == "openrouter" and OPENROUTER_API_KEY:
+        llm_ok = True
+    elif LLM_BACKEND == "zai" and ZAI_API_KEY:
+        llm_ok = True
+
     bankr = BankrClient(BANKR_API_KEY)
     coord = CoordinatorClient(COORDINATOR_URL, DRILLER_ADDRESS, bankr)
-    solver = LLMSolver(LLM_BACKEND, LLM_MODEL, OPENROUTER_API_KEY, ZAI_API_KEY)
-    log(f"LLM: {LLM_MODEL} via {LLM_BACKEND}")
+    if llm_ok:
+        solver = LLMSolver(LLM_BACKEND, LLM_MODEL, OPENROUTER_API_KEY, ZAI_API_KEY)
+        log(f"LLM: {LLM_MODEL} via {LLM_BACKEND}")
+    else:
+        solver = LLMSolver.__new__(LLMSolver)
+        solver.client = None
+        solver.model = None
+        solver.backend = None
+        log("LLM: disabled (no API key) — deterministic solver only")
     log(f"Rig tier: {DRILLER_TIER} ({TIER_CREDITS[DRILLER_TIER]} credits/solve)")
 
     await bankr.init()
