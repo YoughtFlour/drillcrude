@@ -1490,12 +1490,8 @@ def _site_ev_score(site, featured_region=None):
 def pick_best_site(sites, tier="wildcat", featured_region=None, min_richness=None):
     """Pick best site by expected credit value.
     min_richness: if set ('rich'/'bonanza'), skip standard sites."""
-    if tier == "wildcat":
-        allowed = ["shallow"]
-    elif tier == "platform":
-        allowed = ["shallow", "medium"]
-    else:
-        allowed = ["shallow", "medium", "deep"]
+    tier = "wildcat"
+    allowed = ["shallow"]
 
     valid = [s for s in sites
              if s.get("estimatedDepth") in allowed
