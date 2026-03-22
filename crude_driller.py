@@ -1637,7 +1637,12 @@ def _site_ev_score(site, featured_region=None):
 def pick_best_site(sites, tier="wildcat", featured_region=None, min_richness=None):
     """Pick best site by expected credit value.
     min_richness: if set ('rich'/'bonanza'), skip standard sites."""
-    allowed = ["shallow", "medium"]
+    if tier == "wildcat":
+        allowed = ["shallow"]
+    elif tier == "platform":
+        allowed = ["shallow", "medium"]
+    else:
+        allowed = ["shallow", "medium", "deep"]
 
     valid = [s for s in sites
              if s.get("estimatedDepth") in allowed
@@ -1858,6 +1863,10 @@ async def drilling_loop(bankr, coord, solver):
                     debug_log("SITE_UNAVAILABLE", site.get('region', '?'))
                     _cached_sites = None
                     await asyncio.sleep(3)
+                    continue
+                elif "rate limit" in err_lower:
+                    log("Coordinator RPC rate limited — waiting 45s...", "WARN")
+                    await asyncio.sleep(45)
                     continue
                 log(f"Drill error: {err}", "WARN")
                 if "active drill" in err_lower:
